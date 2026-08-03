@@ -32,7 +32,9 @@ EOF
 fi
 
 /usr/bin/apt-get install -y --no-install-recommends \
-  network-manager firmware-iwlwifi wireless-regdb \
+  network-manager network-manager-gnome \
+  gnome-keyring libpam-gnome-keyring \
+  firmware-iwlwifi wireless-regdb \
   wpasupplicant iw rfkill kmod
 
 echo "==> Giving Wi-Fi control to NetworkManager..."
@@ -46,7 +48,14 @@ echo "==> Giving Wi-Fi control to NetworkManager..."
   '' \
   '[device]' \
   'wifi.scan-rand-mac-address=yes' \
+  '' \
+  '[connection]' \
+  'wifi.powersave=2' \
   > /etc/NetworkManager/conf.d/10-wifi-fix.conf
+
+/usr/bin/install -d -m 0755 /etc/modprobe.d
+/usr/bin/printf '%s\n' 'options iwlwifi power_save=0' \
+  > /etc/modprobe.d/iwlwifi-onemix3.conf
 
 /usr/bin/timeout 5s /usr/sbin/rfkill unblock all || true
 /usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
@@ -114,3 +123,4 @@ echo "==> Scanning Wi-Fi networks..."
 echo
 echo "Connect with:"
 echo "nmcli device wifi connect \"WIFI_NAME\" password \"PASSWORD\" ifname ${wifi_iface}"
+echo "Reboot or log out/in once so GDM can unlock GNOME Keyring automatically."
