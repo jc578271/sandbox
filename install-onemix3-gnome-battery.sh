@@ -158,20 +158,21 @@ managed=true
 wifi.scan-rand-mac-address=yes
 EOF
 
-/usr/sbin/rfkill unblock wifi || true
-/usr/sbin/modprobe iwlwifi || true
-/usr/bin/udevadm settle || true
-/usr/bin/systemctl enable --now NetworkManager
-/usr/bin/systemctl restart NetworkManager
+/usr/bin/timeout 5s /usr/sbin/rfkill unblock wifi || true
+/usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
+/usr/bin/udevadm settle --timeout=10 || true
+/usr/bin/systemctl enable NetworkManager
+/usr/bin/systemctl restart --no-block NetworkManager || true
+/usr/bin/sleep 3
 
-/usr/bin/nmcli radio wifi on || true
+/usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
 wifi_found=0
 for wifi_path in /sys/class/net/*; do
   if [[ -d ${wifi_path}/wireless ]]; then
     wifi_iface=${wifi_path##*/}
     wifi_found=1
-    /usr/bin/nmcli device set "${wifi_iface}" managed yes || true
-    /usr/bin/nmcli device wifi rescan ifname "${wifi_iface}" || true
+    /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+    /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}" || true
   fi
 done
 
