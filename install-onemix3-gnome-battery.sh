@@ -20,12 +20,25 @@ fi
 echo "==> Cap nhat va cai GNOME Wayland toi gian + goi tiet kiem pin..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+echo "==> Them kho Google Chrome chinh thuc..."
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+  | gpg --dearmor --yes -o /etc/apt/keyrings/google-chrome.gpg
+chmod 0644 /etc/apt/keyrings/google-chrome.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+  > /etc/apt/sources.list.d/google-chrome.list
+apt-get update
+
 apt-get install -y --no-install-recommends \
   sudo \
   gdm3 gnome-shell gnome-session gnome-control-center \
   nautilus gnome-console network-manager pipewire-audio \
   xdg-desktop-portal-gnome iio-sensor-proxy thermald \
   intel-microcode firmware-intel-graphics intel-media-va-driver \
+  ibus ibus-unikey im-config \
+  google-chrome-stable \
   tlp acpi
 
 # Uu tien nguoi goi sudo, sau do nguoi dang nhap tren TTY, cuoi cung la
@@ -41,6 +54,8 @@ fi
 if [[ -n ${target_user} && ${target_user} != root ]] && id "${target_user}" >/dev/null 2>&1; then
   echo "==> Them ${target_user} vao nhom sudo..."
   usermod -aG sudo "${target_user}"
+  echo "==> Chon IBus lam bo go cho ${target_user}..."
+  runuser -u "${target_user}" -- im-config -n ibus
 else
   echo "CANH BAO: Khong tim thay tai khoan nguoi dung thuong de them vao nhom sudo."
 fi
@@ -109,6 +124,8 @@ if [[ -n ${target_user} && ${target_user} != root ]] && id "${target_user}" >/de
     gsettings set org.gnome.settings-daemon.plugins.power idle-dim true
     gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type "suspend"
     gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 900
+    gsettings set org.gnome.desktop.input-sources sources "[(\"xkb\", \"us\"), (\"ibus\", \"Unikey\")]"
+    gsettings set org.gnome.desktop.input-sources mru-sources "[(\"xkb\", \"us\"), (\"ibus\", \"Unikey\")]"
   '
 fi
 
@@ -116,3 +133,5 @@ echo
 echo "HOAN TAT. Khoi dong lai bang: sudo reboot"
 echo "Kiem tra sau reboot: sudo tlp-stat -s"
 echo "Kiem tra Wayland: echo \$XDG_SESSION_TYPE"
+echo "Kiem tra IBus: gsettings get org.gnome.desktop.input-sources sources"
+echo "Chuyen Anh/Viet bang Super + Space"
