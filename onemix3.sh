@@ -52,13 +52,6 @@ echo "==> Them kho Google Chrome..."
   > /etc/apt/sources.list.d/google-chrome.list
 /usr/bin/apt-get update
 
-# Neu may tung chay script cu, go TLP truoc khi cai Power Profiles cua GNOME.
-if /usr/bin/dpkg-query -W -f='${db:Status-Abbrev}' tlp 2>/dev/null \
-  | /usr/bin/grep -q '^ii'; then
-  echo "==> Go TLP va tra quyen quan ly pin ve GNOME..."
-  /usr/bin/apt-get purge -y tlp tlp-rdw || true
-fi
-
 echo "==> Cai GNOME Wayland toi gian..."
 /usr/bin/apt-get install -y --no-install-recommends \
   sudo \
