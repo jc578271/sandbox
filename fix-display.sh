@@ -2,11 +2,14 @@
 set -Eeuo pipefail
 
 # OneMix 3 / OneMix 3 Pro display setup for Debian 13 GNOME Wayland.
-# Kernel fixes the physical panel orientation; GNOME and GDM use normal
-# rotation at 200% scale. Text scaling is reset to 100% to avoid double zoom.
+# - Kernel fixes the physical panel orientation.
+# - Desktop uses 250% scale.
+# - GDM login screen uses 200% scale.
+# - Both use normal rotation because the kernel handles panel orientation.
 
-VERSION="2026-08-03-scale-200-v1"
-SCALE="${SCALE:-2.0}"
+VERSION="2026-08-03-split-scale-v1"
+DESKTOP_SCALE="${DESKTOP_SCALE:-2.5}"
+GDM_SCALE="${GDM_SCALE:-2.0}"
 PANEL_ORIENTATION="${PANEL_ORIENTATION:-left_side_up}"
 
 case "$PANEL_ORIENTATION" in
@@ -30,7 +33,8 @@ command -v sudo >/dev/null 2>&1 || {
 sudo -v
 
 echo "OneMix display setup: $VERSION"
-echo "Scale: $SCALE (200% by default)"
+echo "Desktop scale: $DESKTOP_SCALE"
+echo "GDM scale: $GDM_SCALE"
 echo "Panel orientation: $PANEL_ORIENTATION"
 
 packages=(python3 grub2-common dconf-cli mutter-common-bin)
@@ -65,11 +69,16 @@ kernel_arg="video=${connector}:panel_orientation=${PANEL_ORIENTATION}"
 echo "Connector: $connector"
 echo "Kernel argument: $kernel_arg"
 
-# Keep the working kernel-level panel orientation in GRUB.
+# Preserve the working kernel-level panel-orientation fix in GRUB.
 grub_file=/etc/default/grub
 sudo cp -a "$grub_file" "${grub_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
 tmp_grub="$(mktemp)"
-trap 'rm -f "$tmp_grub"' EXIT
+tmp_greeter=""
+tmp_gdm_monitor=""
+cleanup() {
+  rm -f "$tmp_grub" "$tmp_greeter" "$tmp_gdm_monitor"
+}
+trap cleanup EXIT
 
 python3 - "$grub_file" "$tmp_grub" "$connector" "$kernel_arg" <<'PY'
 import re
@@ -116,13 +125,13 @@ PY
 sudo install -m 0644 "$tmp_grub" "$grub_file"
 sudo update-grub
 
-# Prevent text/accessibility scaling from making 200% look larger than 200%.
+# Keep text scaling neutral so monitor scaling is not compounded.
 gsettings set org.gnome.desktop.interface text-scaling-factor 1.0
 if gsettings list-keys org.gnome.desktop.interface 2>/dev/null | grep -qx scaling-factor; then
   gsettings reset org.gnome.desktop.interface scaling-factor || true
 fi
 
-# Enable fractional monitor scaling without discarding unrelated features.
+# Enable fractional monitor scaling for the user session.
 if gsettings list-keys org.gnome.mutter 2>/dev/null | grep -qx experimental-features; then
   current="$(gsettings get org.gnome.mutter experimental-features)"
   if [[ "$current" != *scale-monitor-framebuffer* ]]; then
@@ -145,42 +154,86 @@ PY
   fi
 fi
 
-# Kernel supplies the physical panel orientation, so Mutter must use transform 0.
-args=(
+# Apply 250% to the logged-in desktop. Kernel supplies physical orientation,
+# therefore Mutter uses transform 0/normal.
+desktop_args=(
   --layout-mode logical
   --logical-monitor
   --primary
-  --scale "$SCALE"
+  --scale "$DESKTOP_SCALE"
   --transform 0
   --monitor "$connector"
 )
 
-if ! gdctl set --verify "${args[@]}"; then
-  echo "Mutter rejected scale $SCALE for this display." >&2
+if ! gdctl set --verify "${desktop_args[@]}"; then
+  echo "Mutter rejected desktop scale $DESKTOP_SCALE." >&2
   gdctl show -m >&2
   exit 1
 fi
 
-gdctl set --persistent "${args[@]}"
+gdctl set --persistent "${desktop_args[@]}"
 
-monitor_file="$HOME/.config/monitors.xml"
+desktop_monitor_file="$HOME/.config/monitors.xml"
 for _ in {1..100}; do
-  [[ -s "$monitor_file" ]] && grep -Eq '<scale>2(\.0+)?</scale>' "$monitor_file" && break
+  if [[ -s "$desktop_monitor_file" ]] && grep -Fq "<scale>${DESKTOP_SCALE}</scale>" "$desktop_monitor_file"; then
+    break
+  fi
   sleep 0.1
 done
 
-if [[ ! -s "$monitor_file" ]] || ! grep -Eq '<scale>2(\.0+)?</scale>' "$monitor_file"; then
-  echo "GNOME did not save a 200% monitors.xml." >&2
-  grep -E '<scale>|<rotation>' "$monitor_file" >&2 || true
+if [[ ! -s "$desktop_monitor_file" ]] || ! grep -Fq "<scale>${DESKTOP_SCALE}</scale>" "$desktop_monitor_file"; then
+  echo "GNOME did not save desktop scale $DESKTOP_SCALE." >&2
+  grep -E '<scale>|<rotation>' "$desktop_monitor_file" >&2 || true
   exit 1
 fi
 
-# Lock sensor rotation; the kernel property is now the single source of truth.
+# Create a separate GDM monitors.xml at 200%, leaving the desktop file at 250%.
+tmp_gdm_monitor="$(mktemp)"
+python3 - "$desktop_monitor_file" "$tmp_gdm_monitor" "$GDM_SCALE" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+source, destination, gdm_scale = sys.argv[1:]
+tree = ET.parse(source)
+root = tree.getroot()
+logical_monitors = root.findall('.//logicalmonitor')
+if not logical_monitors:
+    raise SystemExit('No logicalmonitor found in monitors.xml')
+
+for logical in logical_monitors:
+    scale = logical.find('scale')
+    if scale is None:
+        scale = ET.SubElement(logical, 'scale')
+    scale.text = gdm_scale
+
+    transform = logical.find('transform')
+    if transform is None:
+        transform = ET.SubElement(logical, 'transform')
+
+    rotation = transform.find('rotation')
+    if rotation is None:
+        rotation = ET.SubElement(transform, 'rotation')
+    rotation.text = 'normal'
+
+    flipped = transform.find('flipped')
+    if flipped is None:
+        flipped = ET.SubElement(transform, 'flipped')
+    flipped.text = 'no'
+
+tree.write(destination, encoding='utf-8', xml_declaration=True)
+PY
+
+if ! grep -Fq "<scale>${GDM_SCALE}</scale>" "$tmp_gdm_monitor"; then
+  echo "Failed to create GDM scale $GDM_SCALE configuration." >&2
+  exit 1
+fi
+
+# The kernel property is the only source of physical orientation.
 if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
   sudo systemctl mask --now iio-sensor-proxy.service || true
 fi
 
-# Configure Debian's GDM greeter database.
+# Configure Debian's GDM greeter dconf database.
 greeter_file=/etc/gdm3/greeter.dconf-defaults
 sudo cp -a "$greeter_file" "${greeter_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
 tmp_greeter="$(mktemp)"
@@ -224,7 +277,6 @@ open(destination, 'w', encoding='utf-8').write('\n'.join(cleaned) + '\n')
 PY
 
 sudo install -m 0644 "$tmp_greeter" "$greeter_file"
-rm -f "$tmp_greeter"
 
 gdm_user=""
 for candidate in Debian-gdm gdm; do
@@ -243,32 +295,40 @@ gdm_group="$(id -gn "$gdm_user")"
 gdm_home="$(getent passwd "$gdm_user" | cut -d: -f6)"
 [[ -n "$gdm_home" ]] || gdm_home=/var/lib/gdm3
 
+# Install only the 200% copy for GDM. The user's 250% file remains untouched.
 sudo rm -f \
   /etc/xdg/monitors.xml \
   /var/lib/gdm3/.config/monitors.xml \
   /var/lib/gdm/.config/monitors.xml \
   "$gdm_home/.config/monitors.xml"
 
-sudo install -D -m 0644 "$monitor_file" /etc/xdg/monitors.xml
+sudo install -D -m 0644 "$tmp_gdm_monitor" /etc/xdg/monitors.xml
 sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" "$gdm_home/.config"
 sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
-  "$monitor_file" "$gdm_home/.config/monitors.xml"
+  "$tmp_gdm_monitor" "$gdm_home/.config/monitors.xml"
+
+if [[ "$gdm_home" != /var/lib/gdm3 ]]; then
+  sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" /var/lib/gdm3/.config
+  sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
+    "$tmp_gdm_monitor" /var/lib/gdm3/.config/monitors.xml
+fi
 
 if [[ -x /usr/share/gdm/generate-config ]]; then
   sudo /usr/share/gdm/generate-config
 fi
 
 echo
-echo "Applied values:"
-echo "  monitor scale: 200%"
-echo "  text scale: 100%"
-echo "  logical workspace on a 2560x1600 panel: approximately 1280x800"
+echo "Applied configuration:"
+echo "  Desktop scale: $DESKTOP_SCALE (250% by default)"
+echo "  GDM scale: $GDM_SCALE (200% by default)"
+echo "  Text scale: 1.0"
+echo "  Rotation: normal in GNOME/GDM; kernel handles panel orientation"
 
 echo
 if grep -Fq "$kernel_arg" /proc/cmdline; then
   echo "Kernel orientation is already active."
-  echo "Desktop scale has changed now."
-  echo "To reload the login screen, save your work and run: sudo systemctl restart gdm3"
+  echo "Desktop scale is applied now."
+  echo "Save your work, then reload the login screen with: sudo systemctl restart gdm3"
 else
   echo "Kernel orientation is not active in this boot. Run: sudo reboot"
 fi
