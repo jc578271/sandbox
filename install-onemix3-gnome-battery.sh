@@ -20,6 +20,26 @@ fi
 echo "==> Cap nhat va cai GNOME Wayland toi gian + goi tiet kiem pin..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+
+if ! apt-cache show firmware-iwlwifi >/dev/null 2>&1; then
+  echo "==> Bat kho non-free-firmware cua Debian..."
+  debian_suite=${VERSION_CODENAME:-trixie}
+  cat > /etc/apt/sources.list.d/debian-non-free-firmware.sources <<EOF
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: ${debian_suite} ${debian_suite}-updates
+Components: non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.debian.org/debian-security
+Suites: ${debian_suite}-security
+Components: non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+  apt-get update
+fi
+
 apt-get install -y --no-install-recommends ca-certificates curl gnupg
 
 echo "==> Them kho Google Chrome chinh thuc..."
@@ -37,6 +57,7 @@ apt-get install -y --no-install-recommends \
   nautilus gnome-console network-manager pipewire-audio \
   xdg-desktop-portal-gnome iio-sensor-proxy thermald \
   intel-microcode firmware-intel-graphics intel-media-va-driver \
+  firmware-iwlwifi wireless-regdb wpasupplicant iw rfkill \
   ibus ibus-unikey im-config \
   google-chrome-stable \
   tlp acpi
@@ -64,7 +85,7 @@ fi
 
 if [[ -n ${target_user} && ${target_user} != root ]] && id "${target_user}" >/dev/null 2>&1; then
   echo "==> Them ${target_user} vao nhom sudo..."
-  usermod -aG sudo "${target_user}"
+  /usr/sbin/usermod -aG sudo "${target_user}"
   echo "==> Chon IBus lam bo go cho ${target_user}..."
   runuser -u "${target_user}" -- im-config -n ibus
 else
@@ -125,7 +146,40 @@ EOF
 echo "==> Bat dich vu..."
 systemctl enable NetworkManager gdm3 thermald tlp
 systemctl set-default graphical.target
-systemctl restart tlp || tlp start
+systemctl restart tlp || /usr/sbin/tlp start
+
+echo "==> Cau hinh va quet Wi-Fi Intel AC-3165..."
+install -d -m 0755 /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/10-onemix3-wifi.conf <<'EOF'
+[ifupdown]
+managed=true
+
+[device]
+wifi.scan-rand-mac-address=yes
+EOF
+
+/usr/sbin/rfkill unblock wifi || true
+/usr/sbin/modprobe iwlwifi || true
+udevadm settle || true
+systemctl enable --now NetworkManager
+systemctl restart NetworkManager
+
+nmcli radio wifi on || true
+wifi_found=0
+for wifi_path in /sys/class/net/*; do
+  if [[ -d ${wifi_path}/wireless ]]; then
+    wifi_iface=${wifi_path##*/}
+    wifi_found=1
+    nmcli device set "${wifi_iface}" managed yes || true
+    nmcli device wifi rescan ifname "${wifi_iface}" || true
+  fi
+done
+
+if [[ ${wifi_found} -eq 1 ]]; then
+  echo "Wi-Fi da san sang. Danh sach mang se hien trong GNOME Quick Settings."
+else
+  echo "CANH BAO: Chua thay interface Wi-Fi; xem loi bang: journalctl -k -b | grep -iE 'iwlwifi|firmware'"
+fi
 
 # Cau hinh GNOME cho tai khoan nguoi dung da xac dinh o tren.
 if [[ -n ${target_user} && ${target_user} != root ]] && id "${target_user}" >/dev/null 2>&1; then
@@ -147,3 +201,4 @@ echo "Kiem tra Wayland: echo \$XDG_SESSION_TYPE"
 echo "Kiem tra IBus: gsettings get org.gnome.desktop.input-sources sources"
 echo "Chuyen Anh/Viet bang Super + Space"
 echo "Cam bien OneMix 3 se co huong dung tu man hinh dang nhap GDM."
+echo "Xem danh sach Wi-Fi: nmcli device wifi list"
