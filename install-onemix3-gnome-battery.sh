@@ -41,6 +41,17 @@ apt-get install -y --no-install-recommends \
   google-chrome-stable \
   tlp acpi
 
+echo "==> Sua cam bien xoay nguoc 180 do tren OneMix 3..."
+install -d -m 0755 /etc/udev/hwdb.d
+cat > /etc/udev/hwdb.d/61-onemix3-sensor.hwdb <<'EOF'
+# OneMix 3/3s/3 Pro Bosch accelerometer orientation.
+# Rule local nay bo sung cho cac may co DMI khong khop rule systemd mac dinh.
+sensor:modalias:acpi:BOSC0200:*:dmi:*
+ ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
+EOF
+systemd-hwdb update
+udevadm trigger --subsystem-match=iio --action=change || true
+
 # Uu tien nguoi goi sudo, sau do nguoi dang nhap tren TTY, cuoi cung la
 # tai khoan thuong dau tien (UID >= 1000). Khong bao gio them root.
 target_user=${SUDO_USER:-}
@@ -135,3 +146,4 @@ echo "Kiem tra sau reboot: sudo tlp-stat -s"
 echo "Kiem tra Wayland: echo \$XDG_SESSION_TYPE"
 echo "Kiem tra IBus: gsettings get org.gnome.desktop.input-sources sources"
 echo "Chuyen Anh/Viet bang Super + Space"
+echo "Cam bien OneMix 3 se co huong dung tu man hinh dang nhap GDM."
