@@ -158,6 +158,77 @@ managed=true
 wifi.scan-rand-mac-address=yes
 EOF
 
+# Tu phuc hoi va quet Wi-Fi sau moi lan boot, khi firmware da duoc nap day du.
+/usr/bin/install -m 0755 /dev/null /usr/local/sbin/onemix3-wifi-init
+/usr/bin/cat > /usr/local/sbin/onemix3-wifi-init <<'EOF'
+#!/bin/bash
+set -u
+
+/usr/bin/timeout 5s /usr/sbin/rfkill unblock all || true
+/usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
+/usr/bin/udevadm settle --timeout=10 || true
+/usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
+
+wifi_seen=0
+wifi_ready=0
+for wifi_path in /sys/class/net/*; do
+  [[ -d ${wifi_path}/wireless ]] || continue
+  wifi_iface=${wifi_path##*/}
+  wifi_seen=1
+  /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+
+  wifi_state_code=0
+  for ((wifi_wait=0; wifi_wait<10; wifi_wait++)); do
+    wifi_state=$(/usr/bin/timeout 5s /usr/bin/nmcli -g GENERAL.STATE device show "${wifi_iface}" 2>/dev/null || true)
+    wifi_state_code=${wifi_state%% *}
+    if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
+      wifi_ready=1
+      break
+    fi
+    /usr/bin/sleep 2
+  done
+
+  if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
+    /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}" || true
+  fi
+done
+
+if [[ ${wifi_ready} -eq 1 ]]; then
+  echo "OneMix 3 Wi-Fi ready"
+elif [[ ${wifi_seen} -eq 1 ]]; then
+  echo "OneMix 3 Wi-Fi detected but unavailable"
+else
+  echo "OneMix 3 Wi-Fi interface not found"
+fi
+exit 0
+EOF
+
+/usr/bin/cat > /etc/systemd/system/onemix3-wifi-init.service <<'EOF'
+[Unit]
+Description=Initialize and scan OneMix 3 Intel Wi-Fi
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/onemix3-wifi-init
+TimeoutStartSec=50
+EOF
+
+/usr/bin/cat > /etc/systemd/system/onemix3-wifi-init.timer <<'EOF'
+[Unit]
+Description=Run OneMix 3 Wi-Fi initialization shortly after boot
+
+[Timer]
+OnBootSec=5s
+Unit=onemix3-wifi-init.service
+
+[Install]
+WantedBy=timers.target
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable onemix3-wifi-init.timer
+
 /usr/bin/timeout 5s /usr/sbin/rfkill unblock wifi || true
 /usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
 /usr/bin/udevadm settle --timeout=10 || true
