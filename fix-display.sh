@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# OneMix 3 / OneMix 3 Pro display fix for Debian 13 GNOME Wayland.
-# Version: 2026-08-03-kernel-orientation-v1
-#
-# The firmware reports the portrait-mounted panel orientation incorrectly.
-# Fix it before GDM starts by adding a DRM panel_orientation override to GRUB.
-# GNOME and GDM then use rotation=normal, with 250% scale.
+# OneMix 3 / OneMix 3 Pro display setup for Debian 13 GNOME Wayland.
+# Kernel fixes the physical panel orientation; GNOME and GDM use normal
+# rotation at 200% scale. Text scaling is reset to 100% to avoid double zoom.
 
-SCRIPT_VERSION="2026-08-03-kernel-orientation-v1"
-SCALE="${SCALE:-2.5}"
+VERSION="2026-08-03-scale-200-v1"
+SCALE="${SCALE:-2.0}"
 PANEL_ORIENTATION="${PANEL_ORIENTATION:-left_side_up}"
 
 case "$PANEL_ORIENTATION" in
   normal|upside_down|left_side_up|right_side_up) ;;
   *)
     echo "Invalid PANEL_ORIENTATION: $PANEL_ORIENTATION" >&2
-    echo "Use normal, upside_down, left_side_up, or right_side_up." >&2
     exit 2
     ;;
 esac
@@ -33,11 +29,11 @@ command -v sudo >/dev/null 2>&1 || {
 
 sudo -v
 
-echo "OneMix display setup: $SCRIPT_VERSION"
-echo "Kernel panel orientation: $PANEL_ORIENTATION"
-echo "GNOME/GDM scale: $SCALE"
+echo "OneMix display setup: $VERSION"
+echo "Scale: $SCALE (200% by default)"
+echo "Panel orientation: $PANEL_ORIENTATION"
 
-packages=(python3 grub2-common dconf-cli)
+packages=(python3 grub2-common dconf-cli mutter-common-bin)
 missing=()
 for package in "${packages[@]}"; do
   if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
@@ -50,7 +46,6 @@ if ((${#missing[@]})); then
   sudo apt-get install -y "${missing[@]}"
 fi
 
-# Detect the connected internal panel connector, normally eDP-1.
 connector=""
 for status_file in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-DSI-*/status; do
   [[ -e "$status_file" ]] || continue
@@ -62,8 +57,7 @@ for status_file in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-DSI-*/
 done
 
 if [[ -z "$connector" ]]; then
-  echo "Could not detect the internal eDP/DSI connector." >&2
-  ls -1 /sys/class/drm >&2 || true
+  echo "Could not detect the internal display connector." >&2
   exit 1
 fi
 
@@ -71,11 +65,9 @@ kernel_arg="video=${connector}:panel_orientation=${PANEL_ORIENTATION}"
 echo "Connector: $connector"
 echo "Kernel argument: $kernel_arg"
 
-# Back up and update GRUB without duplicating old panel-orientation arguments.
+# Keep the working kernel-level panel orientation in GRUB.
 grub_file=/etc/default/grub
-grub_backup="${grub_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
-sudo cp -a "$grub_file" "$grub_backup"
-
+sudo cp -a "$grub_file" "${grub_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
 tmp_grub="$(mktemp)"
 trap 'rm -f "$tmp_grub"' EXIT
 
@@ -85,119 +77,132 @@ import shlex
 import sys
 
 source, destination, connector, new_arg = sys.argv[1:]
-text = open(source, encoding='utf-8').read().splitlines()
+lines = open(source, encoding='utf-8').read().splitlines()
 key = 'GRUB_CMDLINE_LINUX_DEFAULT'
 found = False
-output = []
+result = []
 
-for line in text:
+for line in lines:
     match = re.match(r'^(\s*' + re.escape(key) + r'\s*=\s*)(.*)$', line)
     if not match:
-        output.append(line)
+        result.append(line)
         continue
 
     found = True
     prefix, raw = match.groups()
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        raw = raw[1:-1]
+
     try:
-        parsed = shlex.split(raw, posix=True)
-        value = parsed[0] if len(parsed) == 1 else raw.strip().strip('"\'')
+        tokens = shlex.split(raw)
     except ValueError:
-        value = raw.strip().strip('"\'')
+        tokens = raw.split()
 
-    tokens = shlex.split(value, posix=True)
-    cleaned = []
-    for token in tokens:
-        if token.startswith(f'video={connector}:') and 'panel_orientation=' in token:
-            continue
-        cleaned.append(token)
-    cleaned.append(new_arg)
-
-    value = ' '.join(cleaned)
-    value = value.replace('\\', '\\\\').replace('"', '\\"')
-    output.append(f'{prefix}"{value}"')
+    tokens = [
+        token for token in tokens
+        if not (token.startswith(f'video={connector}:') and 'panel_orientation=' in token)
+    ]
+    tokens.append(new_arg)
+    value = ' '.join(tokens).replace('\\', '\\\\').replace('"', '\\"')
+    result.append(f'{prefix}"{value}"')
 
 if not found:
-    output.append(f'{key}="{new_arg}"')
+    result.append(f'{key}="{new_arg}"')
 
-open(destination, 'w', encoding='utf-8').write('\n'.join(output) + '\n')
+open(destination, 'w', encoding='utf-8').write('\n'.join(result) + '\n')
 PY
 
 sudo install -m 0644 "$tmp_grub" "$grub_file"
 sudo update-grub
 
-# The kernel override supplies the physical panel rotation, so persistent
-# Mutter configuration must use normal rotation rather than adding another
-# 90/270-degree transform.
-monitor_file="$HOME/.config/monitors.xml"
-if [[ ! -s "$monitor_file" ]]; then
-  echo "Missing $monitor_file." >&2
-  echo "Open Settings -> Displays, press Apply once, then rerun this script." >&2
+# Prevent text/accessibility scaling from making 200% look larger than 200%.
+gsettings set org.gnome.desktop.interface text-scaling-factor 1.0
+if gsettings list-keys org.gnome.desktop.interface 2>/dev/null | grep -qx scaling-factor; then
+  gsettings reset org.gnome.desktop.interface scaling-factor || true
+fi
+
+# Enable fractional monitor scaling without discarding unrelated features.
+if gsettings list-keys org.gnome.mutter 2>/dev/null | grep -qx experimental-features; then
+  current="$(gsettings get org.gnome.mutter experimental-features)"
+  if [[ "$current" != *scale-monitor-framebuffer* ]]; then
+    merged="$(python3 - "$current" <<'PY'
+import ast
+import sys
+raw = sys.argv[1].strip()
+if raw.startswith('@as '):
+    raw = raw[4:]
+try:
+    values = list(ast.literal_eval(raw))
+except Exception:
+    values = []
+if 'scale-monitor-framebuffer' not in values:
+    values.append('scale-monitor-framebuffer')
+print('[' + ', '.join(repr(v) for v in values) + ']')
+PY
+)"
+    gsettings set org.gnome.mutter experimental-features "$merged"
+  fi
+fi
+
+# Kernel supplies the physical panel orientation, so Mutter must use transform 0.
+args=(
+  --layout-mode logical
+  --logical-monitor
+  --primary
+  --scale "$SCALE"
+  --transform 0
+  --monitor "$connector"
+)
+
+if ! gdctl set --verify "${args[@]}"; then
+  echo "Mutter rejected scale $SCALE for this display." >&2
+  gdctl show -m >&2
   exit 1
 fi
 
-cp -a "$monitor_file" "$monitor_file.onemix-backup.$(date +%Y%m%d-%H%M%S)"
+gdctl set --persistent "${args[@]}"
 
-tmp_monitor="$(mktemp)"
-python3 - "$monitor_file" "$tmp_monitor" "$SCALE" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
+monitor_file="$HOME/.config/monitors.xml"
+for _ in {1..100}; do
+  [[ -s "$monitor_file" ]] && grep -Eq '<scale>2(\.0+)?</scale>' "$monitor_file" && break
+  sleep 0.1
+done
 
-source, destination, scale = sys.argv[1:]
-tree = ET.parse(source)
-root = tree.getroot()
-logical_monitors = root.findall('.//logicalmonitor')
-if not logical_monitors:
-    raise SystemExit('No logicalmonitor found in monitors.xml')
+if [[ ! -s "$monitor_file" ]] || ! grep -Eq '<scale>2(\.0+)?</scale>' "$monitor_file"; then
+  echo "GNOME did not save a 200% monitors.xml." >&2
+  grep -E '<scale>|<rotation>' "$monitor_file" >&2 || true
+  exit 1
+fi
 
-for logical in logical_monitors:
-    scale_node = logical.find('scale')
-    if scale_node is None:
-        scale_node = ET.SubElement(logical, 'scale')
-    scale_node.text = scale
+# Lock sensor rotation; the kernel property is now the single source of truth.
+if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
+  sudo systemctl mask --now iio-sensor-proxy.service || true
+fi
 
-    transform = logical.find('transform')
-    if transform is None:
-        transform = ET.SubElement(logical, 'transform')
-
-    rotation = transform.find('rotation')
-    if rotation is None:
-        rotation = ET.SubElement(transform, 'rotation')
-    rotation.text = 'normal'
-
-    flipped = transform.find('flipped')
-    if flipped is None:
-        flipped = ET.SubElement(transform, 'flipped')
-    flipped.text = 'no'
-
-tree.write(destination, encoding='utf-8', xml_declaration=True)
-PY
-
-install -m 0600 "$tmp_monitor" "$monitor_file"
-rm -f "$tmp_monitor"
-
-# Debian GDM reads greeter settings from /etc/gdm3/greeter.dconf-defaults.
-# Enable fractional scaling and lock auto-rotation in that actual database.
+# Configure Debian's GDM greeter database.
 greeter_file=/etc/gdm3/greeter.dconf-defaults
-greeter_backup="${greeter_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
-sudo cp -a "$greeter_file" "$greeter_backup"
-
+sudo cp -a "$greeter_file" "${greeter_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
 tmp_greeter="$(mktemp)"
+
 python3 - "$greeter_file" "$tmp_greeter" <<'PY'
 import re
 import sys
 
 source, destination = sys.argv[1:]
 lines = open(source, encoding='utf-8').read().splitlines()
-settings = {
+managed = {
     'org/gnome/mutter': {
         'experimental-features': "['scale-monitor-framebuffer']",
     },
     'org/gnome/settings-daemon/peripherals/touchscreen': {
         'orientation-lock': 'true',
     },
+    'org/gnome/desktop/interface': {
+        'text-scaling-factor': '1.0',
+    },
 }
 
-# Remove existing copies of the managed keys, preserving all unrelated lines.
 current = None
 cleaned = []
 for line in lines:
@@ -206,15 +211,14 @@ for line in lines:
         current = section.group(1)
         cleaned.append(line)
         continue
-    key_match = re.match(r'^\s*([A-Za-z0-9_-]+)\s*=.*$', line)
-    if current in settings and key_match and key_match.group(1) in settings[current]:
+    key = re.match(r'^\s*([A-Za-z0-9_-]+)\s*=.*$', line)
+    if current in managed and key and key.group(1) in managed[current]:
         continue
     cleaned.append(line)
 
-for section, values in settings.items():
+for section, values in managed.items():
     cleaned.extend(['', f'[{section}]'])
-    for key, value in values.items():
-        cleaned.append(f'{key}={value}')
+    cleaned.extend(f'{key}={value}' for key, value in values.items())
 
 open(destination, 'w', encoding='utf-8').write('\n'.join(cleaned) + '\n')
 PY
@@ -222,17 +226,6 @@ PY
 sudo install -m 0644 "$tmp_greeter" "$greeter_file"
 rm -f "$tmp_greeter"
 
-# Remove obsolete dconf snippets created by earlier versions of this script.
-sudo rm -f \
-  /etc/dconf/db/gdm.d/00-onemix-display \
-  /etc/dconf/db/gdm.d/locks/00-onemix-display
-
-# Stop the sensor from applying another rotation after the kernel property.
-if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
-  sudo systemctl mask --now iio-sensor-proxy.service || true
-fi
-
-# Install the same normal-rotation configuration for GDM.
 gdm_user=""
 for candidate in Debian-gdm gdm; do
   if id "$candidate" >/dev/null 2>&1; then
@@ -261,20 +254,21 @@ sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" "$gdm_home/.config"
 sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
   "$monitor_file" "$gdm_home/.config/monitors.xml"
 
-# Debian recompiles this database when GDM starts; compile it now as well.
 if [[ -x /usr/share/gdm/generate-config ]]; then
   sudo /usr/share/gdm/generate-config
 fi
 
 echo
-echo "Installed kernel argument:"
-grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file"
+echo "Applied values:"
+echo "  monitor scale: 200%"
+echo "  text scale: 100%"
+echo "  logical workspace on a 2560x1600 panel: approximately 1280x800"
 
 echo
-echo "Persistent desktop/GDM monitor values:"
-grep -E '<scale>|<rotation>|<flipped>' "$monitor_file" || true
-
-echo
-echo "Configuration written successfully."
-echo "A FULL REBOOT is required because panel_orientation is a kernel option."
-echo "The script did not reboot automatically. Run: sudo reboot"
+if grep -Fq "$kernel_arg" /proc/cmdline; then
+  echo "Kernel orientation is already active."
+  echo "Desktop scale has changed now."
+  echo "To reload the login screen, save your work and run: sudo systemctl restart gdm3"
+else
+  echo "Kernel orientation is not active in this boot. Run: sudo reboot"
+fi
