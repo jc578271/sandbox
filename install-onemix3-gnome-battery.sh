@@ -58,7 +58,8 @@ echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.
   gnome-keyring libpam-gnome-keyring pipewire-audio \
   xdg-desktop-portal-gnome iio-sensor-proxy thermald \
   intel-microcode firmware-intel-graphics intel-media-va-driver \
-  firmware-iwlwifi wireless-regdb wpasupplicant iw rfkill \
+  firmware-iwlwifi wireless-regdb wpasupplicant iw rfkill kmod \
+  iproute2 pciutils \
   ibus ibus-unikey im-config \
   google-chrome-stable \
   tlp acpi
@@ -128,7 +129,8 @@ SOUND_POWER_SAVE_CONTROLLER=Y
 RUNTIME_PM_ON_AC=on
 RUNTIME_PM_ON_BAT=auto
 PCIE_ASPM_ON_AC=default
-PCIE_ASPM_ON_BAT=powersupersave
+# Giu ASPM mac dinh de tranh lam Intel AC-3165 chap chon khi dung pin.
+PCIE_ASPM_ON_BAT=default
 AHCI_RUNTIME_PM_ON_AC=on
 AHCI_RUNTIME_PM_ON_BAT=auto
 
@@ -152,6 +154,9 @@ echo "==> Bat dich vu..."
 echo "==> Cau hinh va quet Wi-Fi Intel AC-3165..."
 /usr/bin/install -d -m 0755 /etc/NetworkManager/conf.d
 /usr/bin/cat > /etc/NetworkManager/conf.d/10-onemix3-wifi.conf <<'EOF'
+[main]
+plugins=ifupdown,keyfile
+
 [ifupdown]
 managed=true
 
@@ -185,6 +190,10 @@ for wifi_path in /sys/class/net/*; do
   wifi_iface=${wifi_path##*/}
   wifi_seen=1
   /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+  /usr/sbin/ip link set "${wifi_iface}" up || true
+  if [[ -w ${wifi_path}/device/power/control ]]; then
+    echo on > "${wifi_path}/device/power/control"
+  fi
 
   wifi_state_code=0
   for ((wifi_wait=0; wifi_wait<10; wifi_wait++)); do
@@ -238,22 +247,34 @@ EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl enable onemix3-wifi-init.timer
 
-/usr/bin/timeout 5s /usr/sbin/rfkill unblock wifi || true
+/usr/bin/timeout 5s /usr/sbin/rfkill unblock all || true
 /usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
 /usr/bin/udevadm settle --timeout=10 || true
 /usr/bin/systemctl enable NetworkManager
-/usr/bin/systemctl restart --no-block NetworkManager || true
 /usr/bin/systemctl restart --no-block wpa_supplicant || true
-/usr/bin/sleep 3
+/usr/bin/systemctl restart NetworkManager
+/usr/bin/sleep 5
 
 /usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
 wifi_found=0
 wifi_ready=0
+wifi_pci_address=""
 for wifi_path in /sys/class/net/*; do
   if [[ -d ${wifi_path}/wireless ]]; then
     wifi_iface=${wifi_path##*/}
     wifi_found=1
     /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+    /usr/sbin/ip link set "${wifi_iface}" up || true
+
+    if [[ -w ${wifi_path}/device/power/control ]]; then
+      echo on > "${wifi_path}/device/power/control"
+    fi
+    wifi_device_path=$(/usr/bin/readlink -f "${wifi_path}/device" 2>/dev/null || true)
+    wifi_pci_candidate=${wifi_device_path##*/}
+    wifi_pci_candidate=${wifi_pci_candidate#0000:}
+    if [[ ${wifi_pci_candidate} =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+      wifi_pci_address=${wifi_pci_candidate}
+    fi
 
     wifi_state=""
     wifi_state_code=0
@@ -275,12 +296,31 @@ for wifi_path in /sys/class/net/*; do
   fi
 done
 
+# Khong cho TLP autosuspend rieng card Wi-Fi, ke ca khi may dang dung pin.
+if [[ -n ${wifi_pci_address} ]]; then
+  /usr/bin/printf '%s\n' \
+    '# Keep Intel Wi-Fi fully awake for connection stability.' \
+    "RUNTIME_PM_DISABLE=\"${wifi_pci_address}\"" \
+    > /etc/tlp.d/02-onemix3-wifi.conf
+  /usr/bin/systemctl restart tlp || /usr/sbin/tlp start
+fi
+
 if [[ ${wifi_ready} -eq 1 ]]; then
   echo "Wi-Fi da san sang. Danh sach mang se hien trong GNOME Quick Settings."
+  /usr/bin/nmcli device wifi list
 elif [[ ${wifi_found} -eq 1 ]]; then
   echo "Wi-Fi da duoc nhan dien nhung chua san sang. Hay reboot de nap firmware/driver moi."
+  /usr/bin/nmcli -f GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.REASON device show || true
+  /usr/sbin/rfkill list || true
+  /usr/bin/journalctl -k -b --no-pager \
+    | /usr/bin/grep -iE 'iwlwifi|firmware' \
+    | /usr/bin/tail -n 50 || true
 else
   echo "CANH BAO: Chua thay interface Wi-Fi; xem loi bang: journalctl -k -b | grep -iE 'iwlwifi|firmware'"
+  /usr/bin/lspci -nnk | /usr/bin/grep -A4 -iE 'network|wireless' || true
+  /usr/bin/journalctl -k -b --no-pager \
+    | /usr/bin/grep -iE 'iwlwifi|firmware' \
+    | /usr/bin/tail -n 50 || true
 fi
 
 # Cau hinh GNOME cho tai khoan nguoi dung da xac dinh o tren.
