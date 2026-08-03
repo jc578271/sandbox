@@ -54,7 +54,8 @@ echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.
 /usr/bin/apt-get install -y --no-install-recommends \
   sudo \
   gdm3 gnome-shell gnome-session gnome-control-center \
-  nautilus gnome-console network-manager pipewire-audio \
+  nautilus gnome-console network-manager network-manager-gnome \
+  gnome-keyring libpam-gnome-keyring pipewire-audio \
   xdg-desktop-portal-gnome iio-sensor-proxy thermald \
   intel-microcode firmware-intel-graphics intel-media-va-driver \
   firmware-iwlwifi wireless-regdb wpasupplicant iw rfkill \
@@ -119,7 +120,7 @@ PLATFORM_PROFILE_ON_AC=balanced
 PLATFORM_PROFILE_ON_BAT=low-power
 
 WIFI_PWR_ON_AC=off
-WIFI_PWR_ON_BAT=on
+WIFI_PWR_ON_BAT=off
 SOUND_POWER_SAVE_ON_AC=0
 SOUND_POWER_SAVE_ON_BAT=1
 SOUND_POWER_SAVE_CONTROLLER=Y
@@ -156,6 +157,14 @@ managed=true
 
 [device]
 wifi.scan-rand-mac-address=yes
+
+[connection]
+wifi.powersave=2
+EOF
+
+# Intel AC-3165 tren OneMix 3 co the mat ket noi khi power-save qua manh.
+/usr/bin/cat > /etc/modprobe.d/iwlwifi-onemix3.conf <<'EOF'
+options iwlwifi power_save=0
 EOF
 
 # Tu phuc hoi va quet Wi-Fi sau moi lan boot, khi firmware da duoc nap day du.
@@ -295,3 +304,4 @@ echo "Kiem tra IBus: gsettings get org.gnome.desktop.input-sources sources"
 echo "Chuyen Anh/Viet bang Super + Space"
 echo "Cam bien OneMix 3 se co huong dung tu man hinh dang nhap GDM."
 echo "Xem danh sach Wi-Fi: nmcli device wifi list"
+echo "GNOME Keyring se luu mat khau Wi-Fi sau khi dang nhap lai."
