@@ -2,32 +2,23 @@
 set -Eeuo pipefail
 
 # OneMix 3 / OneMix 3 Pro display fix for Debian 13 GNOME Wayland.
-# Version: 2026-08-03-gdm-v4
-# Desktop and GDM intentionally use opposite rotations because the OneMix
-# panel orientation is interpreted differently by the GDM greeter.
+# Version: 2026-08-03-kernel-orientation-v1
+#
+# The firmware reports the portrait-mounted panel orientation incorrectly.
+# Fix it before GDM starts by adding a DRM panel_orientation override to GRUB.
+# GNOME and GDM then use rotation=normal, with 250% scale.
 
-SCRIPT_VERSION="2026-08-03-gdm-v4"
-ROTATION="${1:-90}"
+SCRIPT_VERSION="2026-08-03-kernel-orientation-v1"
 SCALE="${SCALE:-2.5}"
-TARGET_LOGICAL="1024x640"
+PANEL_ORIENTATION="${PANEL_ORIENTATION:-left_side_up}"
 
-case "$ROTATION" in
-  left) ROTATION=270 ;;
-  right) ROTATION=90 ;;
-  inverted|upside-down) ROTATION=180 ;;
-  normal) ROTATION=0 ;;
-  0|90|180|270) ;;
+case "$PANEL_ORIENTATION" in
+  normal|upside_down|left_side_up|right_side_up) ;;
   *)
-    echo "Usage: $0 [left|right|normal|0|90|180|270]" >&2
+    echo "Invalid PANEL_ORIENTATION: $PANEL_ORIENTATION" >&2
+    echo "Use normal, upside_down, left_side_up, or right_side_up." >&2
     exit 2
     ;;
-esac
-
-case "$ROTATION" in
-  0) GDM_ROTATION=180 ;;
-  90) GDM_ROTATION=270 ;;
-  180) GDM_ROTATION=0 ;;
-  270) GDM_ROTATION=90 ;;
 esac
 
 if [[ ${EUID} -eq 0 ]]; then
@@ -40,127 +31,118 @@ command -v sudo >/dev/null 2>&1 || {
   exit 1
 }
 
-printf 'OneMix display setup: %s\n' "$SCRIPT_VERSION"
-printf 'Desktop rotation: %s degrees\n' "$ROTATION"
-printf 'GDM rotation: %s degrees\n' "$GDM_ROTATION"
-printf 'Scale: %s (250%%)\n' "$SCALE"
-
 sudo -v
 
-packages=(mutter-common-bin dconf-cli python3)
+echo "OneMix display setup: $SCRIPT_VERSION"
+echo "Kernel panel orientation: $PANEL_ORIENTATION"
+echo "GNOME/GDM scale: $SCALE"
+
+packages=(python3 grub2-common dconf-cli)
 missing=()
 for package in "${packages[@]}"; do
   if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
     missing+=("$package")
   fi
 done
+
 if ((${#missing[@]})); then
   sudo apt-get update
   sudo apt-get install -y "${missing[@]}"
 fi
 
-# Prevent the accelerometer from changing either session after configuration.
-if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
-  sudo systemctl mask --now iio-sensor-proxy.service || true
-fi
-if gsettings list-schemas | grep -qx org.gnome.settings-daemon.peripherals.touchscreen; then
-  gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock true || true
-fi
-
-# Enable fractional scaling for the current desktop user.
-if gsettings list-keys org.gnome.mutter 2>/dev/null | grep -qx experimental-features; then
-  current="$(gsettings get org.gnome.mutter experimental-features)"
-  if [[ "$current" != *scale-monitor-framebuffer* ]]; then
-    merged="$(python3 - "$current" <<'PY'
-import ast, sys
-raw = sys.argv[1].strip()
-if raw.startswith('@as '):
-    raw = raw[4:]
-try:
-    values = list(ast.literal_eval(raw))
-except Exception:
-    values = []
-if 'scale-monitor-framebuffer' not in values:
-    values.append('scale-monitor-framebuffer')
-print('[' + ', '.join(repr(v) for v in values) + ']')
-PY
-)"
-    gsettings set org.gnome.mutter experimental-features "$merged"
+# Detect the connected internal panel connector, normally eDP-1.
+connector=""
+for status_file in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-DSI-*/status; do
+  [[ -e "$status_file" ]] || continue
+  if [[ "$(cat "$status_file")" == connected ]]; then
+    drm_name="$(basename "$(dirname "$status_file")")"
+    connector="${drm_name#*-}"
+    break
   fi
-fi
-
-show_output="$(gdctl show)"
-connector="$(printf '%s\n' "$show_output" \
-  | sed -nE 's/.*Monitor ([^ ]+) \(Built-in display\).*/\1/p' \
-  | head -n1)"
-
-if [[ -z "$connector" ]]; then
-  for status_file in /sys/class/drm/card*-eDP-*/status /sys/class/drm/card*-DSI-*/status; do
-    [[ -e "$status_file" ]] || continue
-    if [[ "$(cat "$status_file")" == connected ]]; then
-      drm_name="$(basename "$(dirname "$status_file")")"
-      connector="${drm_name#*-}"
-      break
-    fi
-  done
-fi
-
-if [[ -z "$connector" ]]; then
-  echo "Could not detect the internal display connector." >&2
-  gdctl show -m >&2
-  exit 1
-fi
-printf 'Internal display: %s\n' "$connector"
-
-args=(
-  --layout-mode logical
-  --logical-monitor
-  --primary
-  --scale "$SCALE"
-  --transform "$ROTATION"
-  --monitor "$connector"
-)
-
-if ! gdctl set --verify "${args[@]}"; then
-  echo "Mutter rejected this scale or desktop rotation." >&2
-  gdctl show -m >&2
-  exit 1
-fi
-
-monitor_file="$HOME/.config/monitors.xml"
-mkdir -p "$HOME/.config"
-[[ -f "$monitor_file" ]] && cp -a "$monitor_file" "$monitor_file.backup.$(date +%Y%m%d-%H%M%S)"
-rm -f "$monitor_file"
-gdctl set --persistent "${args[@]}"
-
-for _ in {1..100}; do
-  [[ -s "$monitor_file" ]] && grep -Eq '<scale>2\.5(0*)?</scale>' "$monitor_file" && break
-  sleep 0.1
 done
 
-if [[ ! -s "$monitor_file" ]] || ! grep -Eq '<scale>2\.5(0*)?</scale>' "$monitor_file"; then
-  echo "Mutter did not create a valid 250% monitors.xml." >&2
+if [[ -z "$connector" ]]; then
+  echo "Could not detect the internal eDP/DSI connector." >&2
+  ls -1 /sys/class/drm >&2 || true
   exit 1
 fi
 
-# Create a separate GDM XML. The login greeter on this OneMix needs the
-# opposite 180-degree landscape transform from the desktop session.
-gdm_monitor_file="$(mktemp)"
-trap 'rm -f "$gdm_monitor_file"' EXIT
+kernel_arg="video=${connector}:panel_orientation=${PANEL_ORIENTATION}"
+echo "Connector: $connector"
+echo "Kernel argument: $kernel_arg"
 
-python3 - "$monitor_file" "$gdm_monitor_file" "$GDM_ROTATION" <<'PY'
+# Back up and update GRUB without duplicating old panel-orientation arguments.
+grub_file=/etc/default/grub
+grub_backup="${grub_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
+sudo cp -a "$grub_file" "$grub_backup"
+
+tmp_grub="$(mktemp)"
+trap 'rm -f "$tmp_grub"' EXIT
+
+python3 - "$grub_file" "$tmp_grub" "$connector" "$kernel_arg" <<'PY'
+import re
+import shlex
+import sys
+
+source, destination, connector, new_arg = sys.argv[1:]
+text = open(source, encoding='utf-8').read().splitlines()
+key = 'GRUB_CMDLINE_LINUX_DEFAULT'
+found = False
+output = []
+
+for line in text:
+    match = re.match(r'^(\s*' + re.escape(key) + r'\s*=\s*)(.*)$', line)
+    if not match:
+        output.append(line)
+        continue
+
+    found = True
+    prefix, raw = match.groups()
+    try:
+        parsed = shlex.split(raw, posix=True)
+        value = parsed[0] if len(parsed) == 1 else raw.strip().strip('"\'')
+    except ValueError:
+        value = raw.strip().strip('"\'')
+
+    tokens = shlex.split(value, posix=True)
+    cleaned = []
+    for token in tokens:
+        if token.startswith(f'video={connector}:') and 'panel_orientation=' in token:
+            continue
+        cleaned.append(token)
+    cleaned.append(new_arg)
+
+    value = ' '.join(cleaned)
+    value = value.replace('\\', '\\\\').replace('"', '\\"')
+    output.append(f'{prefix}"{value}"')
+
+if not found:
+    output.append(f'{key}="{new_arg}"')
+
+open(destination, 'w', encoding='utf-8').write('\n'.join(output) + '\n')
+PY
+
+sudo install -m 0644 "$tmp_grub" "$grub_file"
+sudo update-grub
+
+# The kernel override supplies the physical panel rotation, so persistent
+# Mutter configuration must use normal rotation rather than adding another
+# 90/270-degree transform.
+monitor_file="$HOME/.config/monitors.xml"
+if [[ ! -s "$monitor_file" ]]; then
+  echo "Missing $monitor_file." >&2
+  echo "Open Settings -> Displays, press Apply once, then rerun this script." >&2
+  exit 1
+fi
+
+cp -a "$monitor_file" "$monitor_file.onemix-backup.$(date +%Y%m%d-%H%M%S)"
+
+tmp_monitor="$(mktemp)"
+python3 - "$monitor_file" "$tmp_monitor" "$SCALE" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
-source, destination, degrees = sys.argv[1:]
-rotation_by_degrees = {
-    '0': 'normal',
-    '90': 'right',
-    '180': 'upside_down',
-    '270': 'left',
-}
-rotation = rotation_by_degrees[degrees]
-
+source, destination, scale = sys.argv[1:]
 tree = ET.parse(source)
 root = tree.getroot()
 logical_monitors = root.findall('.//logicalmonitor')
@@ -168,13 +150,20 @@ if not logical_monitors:
     raise SystemExit('No logicalmonitor found in monitors.xml')
 
 for logical in logical_monitors:
+    scale_node = logical.find('scale')
+    if scale_node is None:
+        scale_node = ET.SubElement(logical, 'scale')
+    scale_node.text = scale
+
     transform = logical.find('transform')
     if transform is None:
         transform = ET.SubElement(logical, 'transform')
-    rotation_node = transform.find('rotation')
-    if rotation_node is None:
-        rotation_node = ET.SubElement(transform, 'rotation')
-    rotation_node.text = rotation
+
+    rotation = transform.find('rotation')
+    if rotation is None:
+        rotation = ET.SubElement(transform, 'rotation')
+    rotation.text = 'normal'
+
     flipped = transform.find('flipped')
     if flipped is None:
         flipped = ET.SubElement(transform, 'flipped')
@@ -183,25 +172,67 @@ for logical in logical_monitors:
 tree.write(destination, encoding='utf-8', xml_declaration=True)
 PY
 
-# GDM has its own dconf profile.
-sudo install -d -m 0755 /etc/dconf/profile /etc/dconf/db/gdm.d /etc/dconf/db/gdm.d/locks
-sudo tee /etc/dconf/profile/gdm >/dev/null <<'EOF_GDM_PROFILE'
-user-db:user
-system-db:gdm
-file-db:/usr/share/gdm/greeter-dconf-defaults
-EOF_GDM_PROFILE
-sudo tee /etc/dconf/db/gdm.d/00-onemix-display >/dev/null <<'EOF_GDM_CONF'
-[org/gnome/mutter]
-experimental-features=['scale-monitor-framebuffer']
+install -m 0600 "$tmp_monitor" "$monitor_file"
+rm -f "$tmp_monitor"
 
-[org/gnome/settings-daemon/peripherals/touchscreen]
-orientation-lock=true
-EOF_GDM_CONF
-sudo tee /etc/dconf/db/gdm.d/locks/00-onemix-display >/dev/null <<'EOF_GDM_LOCK'
-/org/gnome/settings-daemon/peripherals/touchscreen/orientation-lock
-EOF_GDM_LOCK
-sudo dconf update
+# Debian GDM reads greeter settings from /etc/gdm3/greeter.dconf-defaults.
+# Enable fractional scaling and lock auto-rotation in that actual database.
+greeter_file=/etc/gdm3/greeter.dconf-defaults
+greeter_backup="${greeter_file}.onemix-backup.$(date +%Y%m%d-%H%M%S)"
+sudo cp -a "$greeter_file" "$greeter_backup"
 
+tmp_greeter="$(mktemp)"
+python3 - "$greeter_file" "$tmp_greeter" <<'PY'
+import re
+import sys
+
+source, destination = sys.argv[1:]
+lines = open(source, encoding='utf-8').read().splitlines()
+settings = {
+    'org/gnome/mutter': {
+        'experimental-features': "['scale-monitor-framebuffer']",
+    },
+    'org/gnome/settings-daemon/peripherals/touchscreen': {
+        'orientation-lock': 'true',
+    },
+}
+
+# Remove existing copies of the managed keys, preserving all unrelated lines.
+current = None
+cleaned = []
+for line in lines:
+    section = re.match(r'^\s*\[([^]]+)\]\s*$', line)
+    if section:
+        current = section.group(1)
+        cleaned.append(line)
+        continue
+    key_match = re.match(r'^\s*([A-Za-z0-9_-]+)\s*=.*$', line)
+    if current in settings and key_match and key_match.group(1) in settings[current]:
+        continue
+    cleaned.append(line)
+
+for section, values in settings.items():
+    cleaned.extend(['', f'[{section}]'])
+    for key, value in values.items():
+        cleaned.append(f'{key}={value}')
+
+open(destination, 'w', encoding='utf-8').write('\n'.join(cleaned) + '\n')
+PY
+
+sudo install -m 0644 "$tmp_greeter" "$greeter_file"
+rm -f "$tmp_greeter"
+
+# Remove obsolete dconf snippets created by earlier versions of this script.
+sudo rm -f \
+  /etc/dconf/db/gdm.d/00-onemix-display \
+  /etc/dconf/db/gdm.d/locks/00-onemix-display
+
+# Stop the sensor from applying another rotation after the kernel property.
+if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
+  sudo systemctl mask --now iio-sensor-proxy.service || true
+fi
+
+# Install the same normal-rotation configuration for GDM.
 gdm_user=""
 for candidate in Debian-gdm gdm; do
   if id "$candidate" >/dev/null 2>&1; then
@@ -209,40 +240,41 @@ for candidate in Debian-gdm gdm; do
     break
   fi
 done
-[[ -n "$gdm_user" ]] || { echo "Could not find the GDM user." >&2; exit 1; }
+
+if [[ -z "$gdm_user" ]]; then
+  echo "Could not find the GDM system user." >&2
+  exit 1
+fi
 
 gdm_group="$(id -gn "$gdm_user")"
 gdm_home="$(getent passwd "$gdm_user" | cut -d: -f6)"
 [[ -n "$gdm_home" ]] || gdm_home=/var/lib/gdm3
 
-# Remove all stale copies. /etc/xdg is deliberately populated with the
-# GDM-specific transform, while the logged-in user keeps ~/.config/monitors.xml.
 sudo rm -f \
   /etc/xdg/monitors.xml \
   /var/lib/gdm3/.config/monitors.xml \
   /var/lib/gdm/.config/monitors.xml \
-  "$gdm_home/.config/monitors.xml" \
-  "$gdm_home/.config/dconf/user"
+  "$gdm_home/.config/monitors.xml"
 
-sudo install -D -m 0644 "$gdm_monitor_file" /etc/xdg/monitors.xml
+sudo install -D -m 0644 "$monitor_file" /etc/xdg/monitors.xml
 sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" "$gdm_home/.config"
 sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
-  "$gdm_monitor_file" "$gdm_home/.config/monitors.xml"
+  "$monitor_file" "$gdm_home/.config/monitors.xml"
 
-if [[ "$gdm_home" != /var/lib/gdm3 ]]; then
-  sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" /var/lib/gdm3/.config
-  sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
-    "$gdm_monitor_file" /var/lib/gdm3/.config/monitors.xml
+# Debian recompiles this database when GDM starts; compile it now as well.
+if [[ -x /usr/share/gdm/generate-config ]]; then
+  sudo /usr/share/gdm/generate-config
 fi
 
 echo
-echo "Desktop monitors.xml:"
+echo "Installed kernel argument:"
+grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file"
+
+echo
+echo "Persistent desktop/GDM monitor values:"
 grep -E '<scale>|<rotation>|<flipped>' "$monitor_file" || true
 
 echo
-echo "GDM monitors.xml (intentionally opposite rotation):"
-grep -E '<scale>|<rotation>|<flipped>' "$gdm_monitor_file" || true
-
-echo
-echo "Done. Desktop rotation=$ROTATION, GDM rotation=$GDM_ROTATION, scale=250%."
-echo "Save your work, then restart GDM: sudo systemctl restart gdm3"
+echo "Configuration written successfully."
+echo "A FULL REBOOT is required because panel_orientation is a kernel option."
+echo "The script did not reboot automatically. Run: sudo reboot"
