@@ -2,13 +2,11 @@
 set -Eeuo pipefail
 
 # OneMix 3 / OneMix 3 Pro display fix for Debian 13 GNOME Wayland.
-# Version: 2026-08-03-gdm-v2
-# - Rotates the built-in portrait panel to landscape.
-# - Keeps the native panel mode fullscreen.
-# - Uses 250% scaling.
-# - Recreates monitors.xml before copying it to GDM, preventing stale settings.
+# Version: 2026-08-03-gdm-v3
+# - Desktop: rotate right, fullscreen native mode, scale 250%.
+# - GDM: use the same monitors.xml and disable sensor-based auto rotation.
 
-SCRIPT_VERSION="2026-08-03-gdm-v2"
+SCRIPT_VERSION="2026-08-03-gdm-v3"
 ROTATION="${1:-90}"
 SCALE="${SCALE:-2.5}"
 TARGET_LOGICAL="1024x640"
@@ -35,22 +33,37 @@ command -v sudo >/dev/null 2>&1 || {
 }
 
 printf 'OneMix display setup: %s\n' "$SCRIPT_VERSION"
-printf 'Requested rotation: %s degrees\n' "$ROTATION"
-printf 'Requested scale: %s (250%%)\n' "$SCALE"
+printf 'Rotation: %s degrees\n' "$ROTATION"
+printf 'Scale: %s (250%%)\n' "$SCALE"
 
 sudo -v
 
-if ! command -v gdctl >/dev/null 2>&1; then
+packages=(mutter-common-bin dconf-cli python3)
+missing=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
+    missing+=("$package")
+  fi
+done
+
+if ((${#missing[@]})); then
   sudo apt-get update
-  sudo apt-get install -y mutter-common-bin
+  sudo apt-get install -y "${missing[@]}"
 fi
 
-if ! command -v dconf >/dev/null 2>&1; then
-  sudo apt-get update
-  sudo apt-get install -y dconf-cli
+# Disable sensor-driven auto rotation system-wide. On this device the sensor
+# can rotate the GDM greeter a second time after monitors.xml is applied.
+if systemctl list-unit-files 2>/dev/null | grep -q '^iio-sensor-proxy\.service'; then
+  sudo systemctl mask --now iio-sensor-proxy.service || true
 fi
 
-# Enable fractional scaling for the current GNOME user.
+# Lock rotation for the current desktop session too.
+if gsettings list-schemas | grep -qx org.gnome.settings-daemon.peripherals.touchscreen; then
+  gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock true || true
+fi
+
+# Enable fractional scaling for the current user without discarding other
+# experimental Mutter features.
 if gsettings list-keys org.gnome.mutter 2>/dev/null | grep -qx experimental-features; then
   current_features="$(gsettings get org.gnome.mutter experimental-features)"
   if [[ "$current_features" != *scale-monitor-framebuffer* ]]; then
@@ -72,11 +85,6 @@ PY
 )"
     gsettings set org.gnome.mutter experimental-features "$merged_features"
   fi
-fi
-
-# Stop the accelerometer from overriding the selected rotation.
-if gsettings list-schemas | grep -qx org.gnome.settings-daemon.peripherals.touchscreen; then
-  gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock true || true
 fi
 
 show_output="$(gdctl show)"
@@ -112,7 +120,6 @@ args=(
   --monitor "$connector"
 )
 
-# Verify before removing the old persistent file.
 if ! gdctl set --verify "${args[@]}"; then
   echo "Mutter rejected this scale or rotation." >&2
   gdctl show -m >&2
@@ -121,25 +128,15 @@ fi
 
 config_dir="$HOME/.config"
 monitor_file="$config_dir/monitors.xml"
-backup_file=""
 mkdir -p "$config_dir"
 
 if [[ -f "$monitor_file" ]]; then
-  backup_file="$monitor_file.backup.$(date +%Y%m%d-%H%M%S)"
-  cp -a "$monitor_file" "$backup_file"
+  cp -a "$monitor_file" "$monitor_file.backup.$(date +%Y%m%d-%H%M%S)"
 fi
 
-# Important: remove the old file first. The previous script saw the existing
-# file and copied it to GDM before Mutter had finished writing the new values.
 rm -f "$monitor_file"
+gdctl set --persistent "${args[@]}"
 
-if ! gdctl set --persistent "${args[@]}"; then
-  [[ -n "$backup_file" ]] && cp -a "$backup_file" "$monitor_file"
-  echo "Failed to apply the display configuration." >&2
-  exit 1
-fi
-
-# Wait for Mutter to create a genuinely new file containing scale 2.5.
 for _ in {1..100}; do
   if [[ -s "$monitor_file" ]] && grep -Eq '<scale>2\.5(0*)?</scale>' "$monitor_file"; then
     break
@@ -148,35 +145,43 @@ for _ in {1..100}; do
 done
 
 if [[ ! -s "$monitor_file" ]]; then
-  [[ -n "$backup_file" ]] && cp -a "$backup_file" "$monitor_file"
   echo "Mutter did not create a new monitors.xml." >&2
   exit 1
 fi
 
 if ! grep -Eq '<scale>2\.5(0*)?</scale>' "$monitor_file"; then
-  echo "The new monitors.xml does not contain scale 2.5; refusing to copy it to GDM." >&2
-  grep -E '<scale>|<rotation>' "$monitor_file" >&2 || true
+  echo "The new monitors.xml does not contain scale 2.5." >&2
+  grep -E '<scale>|<rotation>|<flipped>' "$monitor_file" >&2 || true
   exit 1
 fi
 
-# Configure fractional scaling in the GDM dconf database.
-sudo install -d -m 0755 /etc/dconf/profile /etc/dconf/db/gdm.d
+# Configure GDM's own dconf database. GDM uses a separate profile from the
+# logged-in user, so orientation-lock must be set there as well.
+sudo install -d -m 0755 \
+  /etc/dconf/profile \
+  /etc/dconf/db/gdm.d \
+  /etc/dconf/db/gdm.d/locks
 
-if [[ ! -f /etc/dconf/profile/gdm ]]; then
-  sudo tee /etc/dconf/profile/gdm >/dev/null <<'EOF'
+sudo tee /etc/dconf/profile/gdm >/dev/null <<'EOF'
 user-db:user
 system-db:gdm
 file-db:/usr/share/gdm/greeter-dconf-defaults
 EOF
-fi
 
 sudo tee /etc/dconf/db/gdm.d/00-onemix-display >/dev/null <<'EOF'
 [org/gnome/mutter]
 experimental-features=['scale-monitor-framebuffer']
+
+[org/gnome/settings-daemon/peripherals/touchscreen]
+orientation-lock=true
 EOF
+
+sudo tee /etc/dconf/db/gdm.d/locks/00-onemix-display >/dev/null <<'EOF'
+/org/gnome/settings-daemon/peripherals/touchscreen/orientation-lock
+EOF
+
 sudo dconf update
 
-# Replace every known stale GDM monitor file with the newly generated file.
 gdm_user=""
 for candidate in Debian-gdm gdm; do
   if id "$candidate" >/dev/null 2>&1; then
@@ -194,19 +199,20 @@ gdm_group="$(id -gn "$gdm_user")"
 gdm_home="$(getent passwd "$gdm_user" | cut -d: -f6)"
 [[ -n "$gdm_home" ]] || gdm_home=/var/lib/gdm3
 
+# Remove stale monitor and dconf user caches that can override the system GDM
+# database. The files are recreated automatically by GDM.
 sudo rm -f \
   /etc/xdg/monitors.xml \
   /var/lib/gdm3/.config/monitors.xml \
   /var/lib/gdm/.config/monitors.xml \
-  "$gdm_home/.config/monitors.xml"
+  "$gdm_home/.config/monitors.xml" \
+  "$gdm_home/.config/dconf/user"
 
 sudo install -D -m 0644 "$monitor_file" /etc/xdg/monitors.xml
 sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" "$gdm_home/.config"
 sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
   "$monitor_file" "$gdm_home/.config/monitors.xml"
 
-# Debian normally uses /var/lib/gdm3. Install there explicitly as well when
-# it differs from the passwd database home.
 if [[ "$gdm_home" != /var/lib/gdm3 ]]; then
   sudo install -d -m 0700 -o "$gdm_user" -g "$gdm_group" /var/lib/gdm3/.config
   sudo install -m 0600 -o "$gdm_user" -g "$gdm_group" \
@@ -214,14 +220,15 @@ if [[ "$gdm_home" != /var/lib/gdm3 ]]; then
 fi
 
 echo
-echo "Fresh desktop configuration:"
+echo "Desktop configuration:"
 grep -E '<scale>|<rotation>|<flipped>' "$monitor_file" || true
 
 echo
-echo "Fresh GDM configuration:"
+echo "GDM configuration:"
 sudo grep -E '<scale>|<rotation>|<flipped>' "$gdm_home/.config/monitors.xml" || true
 
 echo
-echo "Done: rotation $ROTATION, scale 250%, logical workspace $TARGET_LOGICAL."
-echo "Log out once to start a new GDM greeter with the fresh configuration."
-echo "No reboot and no automatic GDM restart were performed."
+echo "Configuration complete: rotation $ROTATION, scale 250%, logical $TARGET_LOGICAL."
+echo "IMPORTANT: GDM is already running, so log out alone may reuse the old greeter."
+echo "Save your work, then run: sudo systemctl restart gdm3"
+echo "That command immediately ends the current graphical session."
