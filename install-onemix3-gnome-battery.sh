@@ -163,21 +163,42 @@ EOF
 /usr/bin/udevadm settle --timeout=10 || true
 /usr/bin/systemctl enable NetworkManager
 /usr/bin/systemctl restart --no-block NetworkManager || true
+/usr/bin/systemctl restart --no-block wpa_supplicant || true
 /usr/bin/sleep 3
 
 /usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
 wifi_found=0
+wifi_ready=0
 for wifi_path in /sys/class/net/*; do
   if [[ -d ${wifi_path}/wireless ]]; then
     wifi_iface=${wifi_path##*/}
     wifi_found=1
     /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
-    /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}" || true
+
+    wifi_state=""
+    wifi_state_code=0
+    for ((wifi_wait=0; wifi_wait<8; wifi_wait++)); do
+      wifi_state=$(/usr/bin/timeout 5s /usr/bin/nmcli -g GENERAL.STATE device show "${wifi_iface}" 2>/dev/null || true)
+      wifi_state_code=${wifi_state%% *}
+      if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
+        break
+      fi
+      /usr/bin/sleep 2
+    done
+
+    if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
+      wifi_ready=1
+      /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}" || true
+    else
+      echo "Wi-Fi ${wifi_iface} dang unavailable; bo qua rescan. Firmware moi co the can reboot."
+    fi
   fi
 done
 
-if [[ ${wifi_found} -eq 1 ]]; then
+if [[ ${wifi_ready} -eq 1 ]]; then
   echo "Wi-Fi da san sang. Danh sach mang se hien trong GNOME Quick Settings."
+elif [[ ${wifi_found} -eq 1 ]]; then
+  echo "Wi-Fi da duoc nhan dien nhung chua san sang. Hay reboot de nap firmware/driver moi."
 else
   echo "CANH BAO: Chua thay interface Wi-Fi; xem loi bang: journalctl -k -b | grep -iE 'iwlwifi|firmware'"
 fi
