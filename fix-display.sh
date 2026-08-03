@@ -4,12 +4,12 @@ set -Eeuo pipefail
 # OneMix 3 / OneMix 3 Pro display fix for Debian 13 GNOME Wayland.
 # - Uses the panel's native 1600x2560 mode so the image fills the display.
 # - Rotates the portrait-mounted panel to landscape.
-# - Uses 4/3 fractional scaling, giving a 1920x1200 logical desktop.
+# - Uses 250% scaling for larger interface elements.
 # - Copies the resulting monitor configuration to GDM.
 
 ROTATION="${1:-90}"           # 90 = rotate right; correct when 270 is upside down.
-SCALE="${SCALE:-1.3333333333333333}"
-TARGET_LOGICAL="1920x1200"
+SCALE="${SCALE:-2.5}"         # 2.5 = 250% scale.
+TARGET_LOGICAL="1024x640"
 
 case "$ROTATION" in
   left) ROTATION=270 ;;
@@ -105,7 +105,7 @@ fi
 
 echo "Internal display: $connector"
 echo "Rotation: $ROTATION degrees"
-echo "Scale: $SCALE (logical target: $TARGET_LOGICAL)"
+echo "Scale: 250% ($SCALE), logical workspace: $TARGET_LOGICAL"
 
 config_dir="$HOME/.config"
 monitor_file="$config_dir/monitors.xml"
@@ -127,7 +127,7 @@ common_args=(
 # Verify first so a rejected scale/rotation cannot replace the working setup.
 if ! gdctl set --verify "${common_args[@]}"; then
   echo >&2
-  echo "Mutter rejected this display configuration." >&2
+  echo "Mutter rejected 250% scaling for this display mode." >&2
   echo "Available modes and supported scales:" >&2
   gdctl show -m >&2
   exit 1
@@ -179,6 +179,6 @@ if [[ -n "$gdm_user" ]]; then
 fi
 
 echo
-echo "Done. The desktop now uses the native panel fullscreen with a $TARGET_LOGICAL logical workspace."
+echo "Done. The display is fullscreen at 250% scale."
 echo "Log out once to make the GDM login screen use the same rotation and scale."
 echo "No reboot or automatic GDM restart was performed."
