@@ -185,34 +185,38 @@ set -u
 
 wifi_seen=0
 wifi_ready=0
-for wifi_path in /sys/class/net/*; do
-  [[ -d ${wifi_path}/wireless ]] || continue
-  wifi_iface=${wifi_path##*/}
-  wifi_seen=1
-  /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
-  /usr/sbin/ip link set "${wifi_iface}" up || true
-  if [[ -w ${wifi_path}/device/power/control ]]; then
-    echo on > "${wifi_path}/device/power/control"
-  fi
+for recovery_try in 1 2; do
+  for wifi_path in /sys/class/net/*; do
+    [[ -d ${wifi_path}/wireless ]] || continue
+    wifi_iface=${wifi_path##*/}
+    wifi_seen=1
+    /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+    /usr/sbin/ip link set "${wifi_iface}" up || true
+    if [[ -w ${wifi_path}/device/power/control ]]; then
+      echo on > "${wifi_path}/device/power/control"
+    fi
 
-  wifi_state_code=0
-  for ((wifi_wait=0; wifi_wait<10; wifi_wait++)); do
     wifi_state=$(/usr/bin/timeout 5s /usr/bin/nmcli -g GENERAL.STATE device show "${wifi_iface}" 2>/dev/null || true)
     wifi_state_code=${wifi_state%% *}
     if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
-      wifi_ready=1
-      break
+      if /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}"; then
+        wifi_ready=1
+        break 2
+      fi
     fi
-    /usr/bin/sleep 2
   done
 
-  if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
-    /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}" || true
+  # Lan dau chua san sang: phuc hoi NetworkManager giong wifi-fix.sh.
+  if [[ ${recovery_try} -eq 1 ]]; then
+    /usr/bin/systemctl restart NetworkManager
+    /usr/bin/sleep 5
+    /usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
   fi
 done
 
 if [[ ${wifi_ready} -eq 1 ]]; then
   echo "OneMix 3 Wi-Fi ready"
+  /usr/bin/systemctl stop onemix3-wifi-init.timer 2>/dev/null || true
 elif [[ ${wifi_seen} -eq 1 ]]; then
   echo "OneMix 3 Wi-Fi detected but unavailable"
 else
@@ -238,7 +242,9 @@ EOF
 Description=Run OneMix 3 Wi-Fi initialization shortly after boot
 
 [Timer]
-OnBootSec=5s
+OnBootSec=8s
+OnUnitInactiveSec=20s
+AccuracySec=2s
 Unit=onemix3-wifi-init.service
 
 [Install]
