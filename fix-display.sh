@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # - Uses 4/3 fractional scaling, giving a 1920x1200 logical desktop.
 # - Copies the resulting monitor configuration to GDM.
 
-ROTATION="${1:-270}"          # 270 = rotate left; correct for most OneMix 3 units.
+ROTATION="${1:-90}"           # 90 = rotate right; correct when 270 is upside down.
 SCALE="${SCALE:-1.3333333333333333}"
 TARGET_LOGICAL="1920x1200"
 
