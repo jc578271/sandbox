@@ -200,8 +200,12 @@ for recovery_try in 1 2; do
     wifi_state_code=${wifi_state%% *}
     if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
       if /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}"; then
-        wifi_ready=1
-        break 2
+        /usr/bin/sleep 3
+        wifi_bssids=$(/usr/bin/timeout 8s /usr/bin/nmcli -g BSSID device wifi list ifname "${wifi_iface}" 2>/dev/null || true)
+        if [[ -n ${wifi_bssids} ]]; then
+          wifi_ready=1
+          break 2
+        fi
       fi
     fi
   done
