@@ -35,7 +35,7 @@ fi
   network-manager network-manager-gnome \
   gnome-keyring libpam-gnome-keyring \
   firmware-iwlwifi wireless-regdb \
-  wpasupplicant iw rfkill kmod
+  wpasupplicant iw rfkill kmod iproute2 pciutils
 
 echo "==> Giving Wi-Fi control to NetworkManager..."
 /usr/bin/install -d -m 0755 /etc/NetworkManager/conf.d
@@ -56,6 +56,86 @@ echo "==> Giving Wi-Fi control to NetworkManager..."
 /usr/bin/install -d -m 0755 /etc/modprobe.d
 /usr/bin/printf '%s\n' 'options iwlwifi power_save=0' \
   > /etc/modprobe.d/iwlwifi-onemix3.conf
+
+echo "==> Installing automatic Wi-Fi recovery for every boot..."
+/usr/bin/install -m 0755 /dev/null /usr/local/sbin/onemix3-wifi-init
+/usr/bin/cat > /usr/local/sbin/onemix3-wifi-init <<'EOF'
+#!/bin/bash
+set -u
+
+/usr/bin/timeout 5s /usr/sbin/rfkill unblock all || true
+/usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
+/usr/bin/udevadm settle --timeout=10 || true
+/usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
+
+wifi_seen=0
+wifi_ready=0
+for recovery_try in 1 2; do
+  for wifi_path in /sys/class/net/*; do
+    [[ -d ${wifi_path}/wireless ]] || continue
+    wifi_iface=${wifi_path##*/}
+    wifi_seen=1
+    /usr/bin/timeout 8s /usr/bin/nmcli -w 5 device set "${wifi_iface}" managed yes || true
+    /usr/sbin/ip link set "${wifi_iface}" up || true
+    if [[ -w ${wifi_path}/device/power/control ]]; then
+      echo on > "${wifi_path}/device/power/control"
+    fi
+
+    wifi_state=$(/usr/bin/timeout 5s /usr/bin/nmcli -g GENERAL.STATE device show "${wifi_iface}" 2>/dev/null || true)
+    wifi_state_code=${wifi_state%% *}
+    if [[ ${wifi_state_code} =~ ^[0-9]+$ ]] && ((wifi_state_code >= 30)); then
+      if /usr/bin/timeout 12s /usr/bin/nmcli -w 8 device wifi rescan ifname "${wifi_iface}"; then
+        wifi_ready=1
+        break 2
+      fi
+    fi
+  done
+
+  if [[ ${recovery_try} -eq 1 ]]; then
+    /usr/bin/systemctl restart NetworkManager
+    /usr/bin/sleep 5
+    /usr/bin/timeout 8s /usr/bin/nmcli -w 5 radio wifi on || true
+  fi
+done
+
+if [[ ${wifi_ready} -eq 1 ]]; then
+  echo "OneMix 3 Wi-Fi ready"
+  /usr/bin/systemctl stop onemix3-wifi-init.timer 2>/dev/null || true
+elif [[ ${wifi_seen} -eq 1 ]]; then
+  echo "OneMix 3 Wi-Fi detected but unavailable; retry scheduled"
+else
+  echo "OneMix 3 Wi-Fi interface not found; retry scheduled"
+fi
+exit 0
+EOF
+
+/usr/bin/cat > /etc/systemd/system/onemix3-wifi-init.service <<'EOF'
+[Unit]
+Description=Recover and scan OneMix 3 Intel Wi-Fi
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/onemix3-wifi-init
+TimeoutStartSec=75
+EOF
+
+/usr/bin/cat > /etc/systemd/system/onemix3-wifi-init.timer <<'EOF'
+[Unit]
+Description=Retry OneMix 3 Wi-Fi initialization after boot
+
+[Timer]
+OnBootSec=8s
+OnUnitInactiveSec=20s
+AccuracySec=2s
+Unit=onemix3-wifi-init.service
+
+[Install]
+WantedBy=timers.target
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable onemix3-wifi-init.timer
 
 /usr/bin/timeout 5s /usr/sbin/rfkill unblock all || true
 /usr/bin/timeout 10s /usr/sbin/modprobe iwlwifi || true
